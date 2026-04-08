@@ -53,26 +53,16 @@ CLASS_LABELS     = {"su": "Surface (su)", "eq": "Earthquake (eq)", "px": "Explos
 # ===========================================================================
 
 def build_folium_map(station_list=None):
-    """
-    Builds a Folium map centred on Mount Rainier with the Draw plugin.
-    The Draw plugin's export=True adds a download button that, when clicked,
-    shows the drawn shape's GeoJSON in a popup — the user copies that JSON
-    into the GeoJSON textbox and clicks 'Load coordinates from GeoJSON'.
-
-    If station_list is provided, plots them as red circle markers.
-    """
     m = folium.Map(location=[46.85, -121.75], zoom_start=9, tiles="OpenStreetMap")
 
-    # Mount Rainier reference marker
     folium.Marker(
         location=[46.8529, -121.7604],
         tooltip="Mount Rainier (4,392 m)",
         icon=folium.Icon(color="red", icon="info-sign"),
     ).add_to(m)
 
-    # Draw plugin with export=True — this is what shows the GeoJSON popup
     Draw(
-        export= False,
+        export=False,
         draw_options={
             "rectangle":    {"shapeOptions": {"color": "#185FA5", "weight": 2}},
             "polygon":      False,
@@ -84,7 +74,6 @@ def build_folium_map(station_list=None):
         edit_options={"edit": False},
     ).add_to(m)
 
-    # Plot stations if provided
     if station_list:
         for s in station_list:
             folium.CircleMarker(
@@ -105,22 +94,6 @@ def build_folium_map(station_list=None):
 # ===========================================================================
 
 def parse_geojson_bbox(geojson_str):
-    """
-    Parses the GeoJSON string exported by the Folium Draw plugin.
-    Returns (minlat, maxlat, minlon, maxlon) or raises ValueError.
-
-    The exported GeoJSON looks like:
-    {
-      "type": "FeatureCollection",
-      "features": [{
-        "type": "Feature",
-        "geometry": {
-          "type": "Polygon",
-          "coordinates": [[[lon1,lat1],[lon2,lat2],[lon3,lat3],[lon4,lat4],[lon1,lat1]]]
-        }
-      }]
-    }
-    """
     geojson_str = geojson_str.strip()
     if not geojson_str:
         raise ValueError("No GeoJSON provided.")
@@ -130,7 +103,6 @@ def parse_geojson_bbox(geojson_str):
     except json.JSONDecodeError as e:
         raise ValueError(f"Invalid JSON: {e}")
 
-    # Handle both FeatureCollection and bare Feature
     if data.get("type") == "FeatureCollection":
         features = data.get("features", [])
         if not features:
@@ -139,13 +111,12 @@ def parse_geojson_bbox(geojson_str):
     elif data.get("type") == "Feature":
         geometry = data.get("geometry", {})
     else:
-        raise ValueError("Unexpected GeoJSON type. Expected FeatureCollection or Feature.")
+        raise ValueError("Unexpected GeoJSON type.")
 
     coords = geometry.get("coordinates", [])
     if not coords:
         raise ValueError("No coordinates found in geometry.")
 
-    # Polygon coordinates: [[[lon, lat], ...]]
     ring = coords[0]
     lons = [pt[0] for pt in ring]
     lats = [pt[1] for pt in ring]
@@ -426,7 +397,7 @@ def make_figure(kept, start_str, end_str, peak_thresh=0.50):
 
 
 # ===========================================================================
-# EVENTS TABLE
+# PER-STATION EVENTS TABLE
 # ===========================================================================
 
 def make_events_table(all_events):
@@ -444,6 +415,70 @@ def make_events_table(all_events):
 
 
 # ===========================================================================
+# ASSOCIATION — cluster detections across stations
+# ===========================================================================
+
+def run_association(all_events, min_stations=4, gap_seconds=20):
+    """
+    Takes the flat list of per-station detections and clusters them by time
+    proximity. Keeps only clusters seen at min_stations or more stations.
+    Mirrors custom_generate_common_events.py exactly.
+    """
+    if not all_events:
+        return pd.DataFrame(columns=[
+            "Rounded start", "Num stations", "Stations",
+            "Classes", "Most common class",
+            "Mean AUC", "Mean max prob", "Mean prob",
+        ])
+
+    df = pd.DataFrame(all_events)
+    df["start_time"] = pd.to_datetime(df["start_time"])
+    df = df.sort_values("start_time").reset_index(drop=True)
+
+    # Cluster by time gap
+    dt = df["start_time"].diff().dt.total_seconds().fillna(1e9)
+    df["cluster_id"] = (dt > gap_seconds).cumsum()
+
+    # Keep strongest detection per station per cluster
+    df = (
+        df.sort_values("max_prob", ascending=False)
+        .drop_duplicates(subset=["cluster_id", "station"], keep="first")
+    )
+
+    grouped = df.groupby("cluster_id").agg(
+        rounded_start=    ("start_time", "min"),
+        num_stations=     ("station",    "nunique"),
+        stations=         ("station",    lambda x: sorted(set(x))),
+        all_classes=      ("class",      lambda x: list(x)),
+        most_common_class=("class",      lambda x: x.mode().iloc[0] if not x.mode().empty else "unknown"),
+        mean_auc=         ("auc",        "mean"),
+        mean_max=         ("max_prob",   "mean"),
+        mean_prob=        ("mean_prob",  "mean"),
+    ).reset_index()
+
+    common = grouped[grouped["num_stations"] >= min_stations].copy()
+    common = common.drop(columns=["cluster_id"])
+
+    common = common.rename(columns={
+        "rounded_start":     "Rounded start",
+        "num_stations":      "Num stations",
+        "stations":          "Stations",
+        "all_classes":       "Classes",
+        "most_common_class": "Most common class",
+        "mean_auc":          "Mean AUC",
+        "mean_max":          "Mean max prob",
+        "mean_prob":         "Mean prob",
+    })
+
+    common["Rounded start"] = common["Rounded start"].astype(str)
+    common["Mean AUC"]      = common["Mean AUC"].round(3)
+    common["Mean max prob"] = common["Mean max prob"].round(3)
+    common["Mean prob"]     = common["Mean prob"].round(3)
+
+    return common.reset_index(drop=True)
+
+
+# ===========================================================================
 # CALLBACKS
 # ===========================================================================
 
@@ -451,10 +486,6 @@ _station_cache = []
 
 
 def cb_load_geojson(geojson_str):
-    """
-    Parse the GeoJSON from the Folium export popup and return
-    the four bounding box coordinates into the textboxes.
-    """
     try:
         minlat, maxlat, minlon, maxlon = parse_geojson_bbox(geojson_str)
         msg = (
@@ -476,8 +507,6 @@ def cb_load_geojson(geojson_str):
 def cb_query_stations(minlat, maxlat, minlon, maxlon, networks):
     global _station_cache
     _station_cache, msg = query_stations(minlat, maxlat, minlon, maxlon, networks)
-
-    # Rebuild map with station markers
     map_html = build_folium_map(station_list=_station_cache if _station_cache else None)
     return msg, map_html
 
@@ -488,36 +517,43 @@ def cb_run_detection(
     use_manual, manual_lat, manual_lon,
     freqmin, freqmax,
     snr_thresh, peak_thresh, max_dist_km,
+    min_stations, gap_seconds,
 ):
     global _station_cache
     t0 = time.time()
 
     if not _station_cache:
-        return None, pd.DataFrame(), "No stations loaded — click 'Query stations from IRIS' first.", ""
+        empty_assoc = pd.DataFrame(columns=[
+            "Rounded start", "Num stations", "Stations",
+            "Classes", "Most common class",
+            "Mean AUC", "Mean max prob", "Mean prob",
+        ])
+        return None, pd.DataFrame(), empty_assoc, "No stations loaded — click 'Query stations from IRIS' first.", ""
 
     try:
         st_time = UTCDateTime(start_str)
         et_time = UTCDateTime(end_str)
     except Exception:
-        return None, pd.DataFrame(), "Invalid time format. Use YYYY-MM-DDTHH:MM:SS", ""
+        empty_assoc = pd.DataFrame()
+        return None, pd.DataFrame(), empty_assoc, "Invalid time format. Use YYYY-MM-DDTHH:MM:SS", ""
 
     if (et_time - st_time) > 6 * 3600:
-        return None, pd.DataFrame(), "Maximum window is 6 hours.", ""
+        return None, pd.DataFrame(), pd.DataFrame(), "Maximum window is 6 hours.", ""
     if et_time <= st_time:
-        return None, pd.DataFrame(), "End time must be after start time.", ""
+        return None, pd.DataFrame(), pd.DataFrame(), "End time must be after start time.", ""
 
     if use_manual and manual_lat and manual_lon:
         try:
             ref_lat = float(manual_lat)
             ref_lon = float(manual_lon)
         except ValueError:
-            return None, pd.DataFrame(), "Invalid manual lat/lon.", ""
+            return None, pd.DataFrame(), pd.DataFrame(), "Invalid manual lat/lon.", ""
     else:
         try:
             ref_lat = (float(minlat) + float(maxlat)) / 2
             ref_lon = (float(minlon) + float(maxlon)) / 2
         except ValueError:
-            return None, pd.DataFrame(), "Enter bounding box coordinates first.", ""
+            return None, pd.DataFrame(), pd.DataFrame(), "Enter bounding box coordinates first.", ""
 
     kept, all_events, log = run_detection(
         stations=_station_cache,
@@ -528,8 +564,13 @@ def cb_run_detection(
         max_dist_km=max_dist_km,
     )
 
-    fig = make_figure(kept, start_str, end_str, peak_thresh)
-    df  = make_events_table(all_events)
+    fig      = make_figure(kept, start_str, end_str, peak_thresh)
+    df       = make_events_table(all_events)
+    assoc_df = run_association(
+        all_events,
+        min_stations=int(min_stations),
+        gap_seconds=float(gap_seconds),
+    )
 
     elapsed = round(time.time() - t0, 1)
     n_su = sum(1 for e in all_events if e["class"] == "su")
@@ -538,9 +579,11 @@ def cb_run_detection(
 
     summary = (
         f"Processed {len(kept)}/{len(_station_cache)} stations in {elapsed}s  ·  "
-        f"Surface events: {n_su}  ·  Earthquakes: {n_eq}  ·  Explosions: {n_px}"
+        f"Surface events: {n_su}  ·  Earthquakes: {n_eq}  ·  Explosions: {n_px}  ·  "
+        f"Associated events (≥{int(min_stations)} stations): {len(assoc_df)}"
     )
-    return fig, df, summary, log
+
+    return fig, df, assoc_df, summary, log
 
 
 # ===========================================================================
@@ -549,10 +592,41 @@ def cb_run_detection(
 
 with gr.Blocks(title="QuakeXNet Explorer", theme=gr.themes.Base()) as demo:
 
+
     gr.Markdown("""
     # QuakeXNet Explorer
-    **Real-time seismic event detection** · Kharita, Denolle et al. · *Seismica* 2026 ·
-    [Paper](https://doi.org/10.26443/seismica.v5i1.2068)
+    ### Real-time seismic event detection in the Pacific Northwest
+
+    This dashboard deploys **QuakeXNet**, a lightweight spectrogram-based CNN
+    trained to discriminate four seismic source types in continuous waveform data:
+
+    | Class | Label | Description |
+    |-------|-------|-------------|
+    | Earthquake | `eq` | Tectonic seismicity |
+    | Explosion | `px` | Quarry blasts and anthropogenic sources |
+    | Surface event | `su` | Glacial icequakes, avalanches, rockfalls, landslides |
+    | Noise | — | Detected implicitly via low probability across all classes |
+
+    **Model:** QuakeXNet 2D — a spectrogram-based CNN with 70k parameters (1.2 MB).
+    Trained on ~200k three-component waveforms from >70k events in the
+    [PNW AI-ready seismic dataset](https://doi.org/10.31223/x53w9q).
+    Achieves **>92% accuracy** on within-domain data and generalises to
+    independent network and global datasets. Processes a full day of
+    100 Hz three-component data in **9 seconds** on commodity hardware.
+    Integrated into [SeisBench](https://github.com/seisbench/seisbench).
+
+    **Use case:** A seismologist hears about a surface event (avalanche, rockfall,
+    glacial icequake) near Mount Rainier. They draw a bounding box on the map,
+    select the time window around the event, and immediately see what QuakeXNet
+    classified across all nearby stations — with waveforms, probability traces,
+    and multi-station association to confirm real detections.
+
+    ---
+    *Kharita, A., Denolle, M., Hutko, A., Hartog, R. & Malone, S. (2026).
+    Exploration of Machine Learning Methods to Seismic Event Discrimination in the Pacific Northwest.
+    Seismica, 5(1).
+    [doi:10.26443/seismica.v5i1.2068](https://doi.org/10.26443/seismica.v5i1.2068)*
+    · [GitHub](https://github.com/Akashkharita/PNW_Seismic_Event_Classification)
     """)
 
     with gr.Row():
@@ -565,7 +639,7 @@ with gr.Blocks(title="QuakeXNet Explorer", theme=gr.themes.Base()) as demo:
                 "**How to use the map:**\n"
                 "1. Click the rectangle tool (toolbar on the left of the map)\n"
                 "2. Draw a rectangle over your region of interest\n"
-                "3. Click anywhere on the map — a popup shows the GeoJSON\n"
+                "3. Click anywhere on the drawn rectangle — a popup shows the GeoJSON\n"
                 "4. Copy the entire JSON text from the popup\n"
                 "5. Paste it into the box below and click **Load coordinates from GeoJSON**"
             )
@@ -573,7 +647,7 @@ with gr.Blocks(title="QuakeXNet Explorer", theme=gr.themes.Base()) as demo:
             map_component = gr.HTML(value=build_folium_map())
 
             geojson_box = gr.Textbox(
-                label="Paste GeoJSON from map export here",
+                label="Paste GeoJSON from map here",
                 placeholder='{"type":"FeatureCollection","features":[...]}',
                 lines=3,
             )
@@ -587,8 +661,7 @@ with gr.Blocks(title="QuakeXNet Explorer", theme=gr.themes.Base()) as demo:
                 maxlon_box = gr.Textbox(label="Max lon", value="-121.4")
 
             bbox_status = gr.Textbox(
-                label="Bounding box status",
-                interactive=False,
+                label="Bounding box status", interactive=False,
                 placeholder="Bounding box will appear here after loading GeoJSON...",
             )
 
@@ -630,20 +703,43 @@ with gr.Blocks(title="QuakeXNet Explorer", theme=gr.themes.Base()) as demo:
                 peak_sl = gr.Slider(0, 1,  value=0.50, step=0.05, label="Min peak prob")
             maxdist_sl = gr.Slider(5, 300, value=50, step=5, label="Max distance (km)")
 
+            gr.Markdown("### 5. Association options")
+            with gr.Row():
+                min_stations_sl = gr.Slider(2, 20, value=4, step=1,
+                                            label="Min stations for association")
+                gap_sl          = gr.Slider(5, 120, value=20, step=5,
+                                            label="Time gap threshold (s)")
+
             run_btn = gr.Button("Run detection", variant="primary", size="lg")
 
     # ---- Results ----
     gr.Markdown("---")
     gr.Markdown("### Results")
 
-    summary_box  = gr.Textbox(
+    summary_box = gr.Textbox(
         label="Summary", interactive=False,
         placeholder="Results will appear here after running detection...",
     )
-    plot_out     = gr.Plot(label="Waveforms + probability traces")
+
+    plot_out = gr.Plot(label="Waveforms + probability traces")
+
+    gr.Markdown("#### Per-station detections")
     events_table = gr.Dataframe(
-        label="Detected events", interactive=False, wrap=True
+        label="All detections (one row per station per event)",
+        interactive=False,
+        wrap=True,
     )
+
+    gr.Markdown("#### Associated events")
+    gr.Markdown(
+        "_Events seen simultaneously at N or more stations — these are your real detections._"
+    )
+    assoc_table = gr.Dataframe(
+        label="Associated events (clustered across stations)",
+        interactive=False,
+        wrap=True,
+    )
+
     log_box = gr.Textbox(
         label="Processing log", interactive=False, lines=8,
         placeholder="Per-station log will appear here...",
@@ -670,8 +766,9 @@ with gr.Blocks(title="QuakeXNet Explorer", theme=gr.themes.Base()) as demo:
             use_manual, manual_lat, manual_lon,
             freqmin_sl, freqmax_sl,
             snr_sl, peak_sl, maxdist_sl,
+            min_stations_sl, gap_sl,
         ],
-        outputs=[plot_out, events_table, summary_box, log_box],
+        outputs=[plot_out, events_table, assoc_table, summary_box, log_box],
     )
 
     gr.Markdown("""
@@ -684,6 +781,6 @@ with gr.Blocks(title="QuakeXNet Explorer", theme=gr.themes.Base()) as demo:
 if __name__ == "__main__":
     demo.launch(
         server_name="0.0.0.0",
-        server_port=7863,
+        server_port=7862,
         share=False,
     )
