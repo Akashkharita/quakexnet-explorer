@@ -72,7 +72,7 @@ def build_folium_map(station_list=None):
 
     # Draw plugin with export=True — this is what shows the GeoJSON popup
     Draw(
-        export=True,
+        export= False,
         draw_options={
             "rectangle":    {"shapeOptions": {"color": "#185FA5", "weight": 2}},
             "polygon":      False,
@@ -565,7 +565,7 @@ with gr.Blocks(title="QuakeXNet Explorer", theme=gr.themes.Base()) as demo:
                 "**How to use the map:**\n"
                 "1. Click the rectangle tool (toolbar on the left of the map)\n"
                 "2. Draw a rectangle over your region of interest\n"
-                "3. Click the **Export** button that appears — a popup shows the GeoJSON\n"
+                "3. Click anywhere on the map — a popup shows the GeoJSON\n"
                 "4. Copy the entire JSON text from the popup\n"
                 "5. Paste it into the box below and click **Load coordinates from GeoJSON**"
             )
